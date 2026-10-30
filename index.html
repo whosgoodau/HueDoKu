@@ -609,7 +609,7 @@
     <button class="chip" id="playerBtn" title="Switch or add a player">👤 <span id="playerName">Guest</span></button>
     <button class="chip" id="pidBtn" title="Puzzle ID: click to copy">#<span id="pidVal">—</span></button>
     <button class="chip" id="restartBtn" title="Start this same puzzle again from the beginning">↺ Restart</button>
-    <button class="chip" id="enterBtn" title="Play a puzzle you were given, or share this one">Enter / share</button>
+    <button class="chip" id="enterBtn" title="Play a puzzle ID you were given, or share this one">Enter / share</button>
     <button class="chip grow" id="archiveBtn" title="Every puzzle played here, with scores">Archive</button>
   </div>
 
@@ -639,11 +639,23 @@
   const ALLMASK = 0b1111111110; // bits 1..9
   const DIFFICULTY = { easy: 44, medium: 34, hard: 28 };
 
+  // The puzzle maker draws every random choice from rng(). Normally that is Math.random; to rebuild a puzzle from
+  // its ID it is swapped for a generator that starts from the ID's seed (mulberry32), so the same seed always gives the same puzzle.
+  let rng = Math.random;
+  function mulberry32(a){
+    return function(){
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a>>>15, 1 | a);
+      t = t + Math.imul(t ^ t>>>7, 61 | t) ^ t;
+      return ((t ^ t>>>14) >>> 0) / 4294967296;
+    };
+  }
+
   function boxOf(r,c){ return Math.floor(r/3)*3 + Math.floor(c/3); }
   function popcount(x){ let c=0; while(x){ x&=x-1; c++; } return c; }
   function shuffle(arr){
     for(let i=arr.length-1;i>0;i--){
-      const j = Math.floor(Math.random()*(i+1));
+      const j = Math.floor(rng()*(i+1));
       [arr[i],arr[j]] = [arr[j],arr[i]];
     }
     return arr;
@@ -937,8 +949,10 @@
   // Everything lives in this browser's localStorage under one key:
   //   users:   { name: { scores: { puzzleId: {plays, solves, best, last} }, current: <saved game> } }
   //   archive: { puzzleId: { p: puzzle (81 digits), s: solution (81 digits), d: level, first: time } }
-  // A puzzle's ID is a hash of its 81 digits, so the same puzzle always has the same ID, and every
-  // player's score is filed under it.
+  // A puzzle's ID is HX- + a level letter (E, M or H) + the 7-character seed it was made from, e.g. HX-M0K3M9Q1.
+  // Anyone who types that ID gets the same puzzle, on any device, with no archive needed. Every player's score is
+  // filed under the ID. (Before v4 an ID was a one-way hash of the 81 digits, 11 characters after HX-. Those still
+  // load, but only in a browser that already holds the puzzle.)
   const KEY = 'chromadoku.gx.v1';
   const BAD_NAMES = ['__proto__','constructor','prototype'];
   const NAME_OK = /^[A-Za-z0-9 ._-]{1,20}$/;
@@ -977,6 +991,26 @@
     h2 = Math.imul(h2 ^ (h2>>>16), 2246822507) ^ Math.imul(h1 ^ (h1>>>13), 3266489909);
     const n = 4294967296 * (2097151 & h2) + (h1>>>0);
     return 'HX-' + n.toString(36).toUpperCase().padStart(11,'0');
+  }
+  const LEVEL_LETTER = { easy:'E', medium:'M', hard:'H' };
+  const LETTER_LEVEL = { E:'easy', M:'medium', H:'hard' };
+  const SEED_ID = /^HX-([EMH])([0-9A-Z]{7})$/;
+  function seedId(level, seed){ return 'HX-' + LEVEL_LETTER[level] + seed.toString(36).toUpperCase().padStart(7,'0'); }
+  function puzzleFromId(id){ // the puzzle an ID stands for, or null when it is not a seed ID
+    const m = SEED_ID.exec(id);
+    if(!m) return null;
+    const seed = parseInt(m[2], 36);
+    if(!(seed <= 4294967295)) return null;
+    const level = LETTER_LEVEL[m[1]];
+    rng = mulberry32(seed);
+    try{
+      const full = generateFull();
+      return { puzzle: makePuzzle(full, DIFFICULTY[level]), solution: full, level };
+    } finally { rng = Math.random; }
+  }
+  function idMatches(id, p){ // does this ID really belong to that puzzle?
+    if(SEED_ID.test(id)){ const g = puzzleFromId(id); return !!g && g.puzzle.join('')===p; }
+    return hashPuzzle(p)===id;
   }
   function ensureUser(name){
     if(!has(db.users,name)) db.users[name] = {created:Date.now(), scores:{}, current:null};
@@ -1020,10 +1054,10 @@
     return i<0 ? null : {place:i+1, of:s.length};
   }
 
-  function startGame(pz, sol, diff, resume){
+  function startGame(pz, sol, diff, resume, id){
     puzzle = pz.slice();
     solution = sol.slice();
-    pid = hashPuzzle(puzzle.join(''));
+    pid = id || hashPuzzle(puzzle.join(''));
     givenMask = puzzle.map(v=>v!==0);
     board = puzzle.slice();
     selected = null; mistakes = 0; seconds = 0; solved = false;
@@ -1048,20 +1082,22 @@
     saveState();
   }
   function newGame(){
-    const diff = difficultySel.value;
-    const full = generateFull();
-    startGame(makePuzzle(full, DIFFICULTY[diff] || 34), full, diff, null);
+    const diff = LEVEL_LETTER[difficultySel.value] ? difficultySel.value : 'medium';
+    const seed = (window.crypto && crypto.getRandomValues) ? crypto.getRandomValues(new Uint32Array(1))[0] : Math.floor(Math.random()*4294967296);
+    const id = seedId(diff, seed);
+    const g = puzzleFromId(id);
+    startGame(g.puzzle, g.solution, diff, null, id);
   }
   function replay(id){
     const a = db.archive[id];
     saveState();
-    startGame(a.p.split('').map(Number), a.s.split('').map(Number), a.d, null);
+    startGame(a.p.split('').map(Number), a.s.split('').map(Number), a.d, null, id);
   }
   function resumeOrNew(){
     const c = ensureUser(user).current;
-    if(c && has(db.archive,c.id) && isDigits81(c.b) && hashPuzzle(db.archive[c.id].p)===c.id){
+    if(c && has(db.archive,c.id) && isDigits81(c.b) && idMatches(c.id, db.archive[c.id].p)){
       const a = db.archive[c.id];
-      startGame(a.p.split('').map(Number), a.s.split('').map(Number), a.d, c);
+      startGame(a.p.split('').map(Number), a.s.split('').map(Number), a.d, c, c.id);
       showMessage('Welcome back, ' + user + ' · your game is restored');
     } else {
       newGame();
@@ -1137,7 +1173,7 @@
     for(const id of Object.keys(raw.archive)){
       const a = raw.archive[id];
       if(!a || !isDigits81(a.p) || !isDigits81(a.s)) continue;
-      const realId = hashPuzzle(a.p);
+      const realId = (SEED_ID.test(id) && idMatches(id, a.p)) ? id : hashPuzzle(a.p);
       if(!has(db.archive,realId)){
         db.archive[realId] = {p:a.p, s:a.s, d:LEVELS.includes(a.d)?a.d:'medium', first:Number.isFinite(a.first)?a.first:Date.now()};
         added++;
@@ -1201,13 +1237,12 @@
   });
 
   // ---------- enter a puzzle ----------
-  // Two things can be typed in:
-  //  - the 81-digit puzzle code (0, . or _ for an empty cell): this works anywhere, it IS the puzzle.
-  //  - a puzzle ID: it is only a hash, so it can be found again only if this browser has played that puzzle
-  //    (or imported an archive file). A hash cannot be turned back into a puzzle.
+  // Type a puzzle ID (e.g. M0K3M9Q1): the puzzle is rebuilt from the ID, so it works on any device.
+  // Also accepted: an 81-digit puzzle (0 . or _ for empty cells) from anywhere, and an old v1-v3 ID, which only
+  // works if this browser has already played that puzzle (those IDs are one-way hashes).
   function enterPuzzle(text){ // returns an error message, or '' once the puzzle has started
     const t = text.replace(/\s+/g,'').toUpperCase();
-    if(!t) return 'Type or paste a puzzle code or ID first.';
+    if(!t) return 'Type or paste a puzzle ID first.';
     const code = t.replace(/[._]/g,'0');
     if(isDigits81(code)){
       const pz = code.split('').map(Number);
@@ -1227,30 +1262,42 @@
       return '';
     }
     const id = t.startsWith('HX-') ? t : 'HX-' + t;
+    if(SEED_ID.test(id)){
+      const g = puzzleFromId(id);
+      if(!g) return 'That ID is not valid.';
+      dlg.close();
+      saveState();
+      startGame(g.puzzle, g.solution, g.level, null, id);
+      showMessage('Puzzle ' + id + ' loaded');
+      return '';
+    }
     if(/^HX-[0-9A-Z]{11}$/.test(id)){
       if(has(db.archive,id)){ dlg.close(); replay(id); showMessage('Puzzle ' + id + ' loaded from the archive'); return ''; }
-      return 'This browser has not played that ID. An ID is only a fingerprint and cannot be turned back into a puzzle: ask for the 81-digit code instead (the box below shows it for the puzzle you are playing).';
+      return 'That is an old-style ID (before v4). It only works in a browser that has played the puzzle. Ask for the puzzle\'s new ID, or its 81 digits.';
     }
-    return 'That is not an 81-digit puzzle code or a puzzle ID.';
+    return 'That is not a puzzle ID (like M0K3M9Q1) or an 81-digit puzzle.';
   }
   function openEnter(){
     dlgTitle.textContent = 'Enter / share a puzzle';
     dlgBody.replaceChildren();
     dlgBody.append(el('h3',{text:'PLAY A PUZZLE YOU WERE GIVEN'}));
-    const input = el('input',{type:'text', placeholder:'81-digit puzzle code, or a puzzle ID', 'aria-label':'Puzzle code or ID', autocomplete:'off', spellcheck:'false'});
+    const input = el('input',{type:'text', placeholder:'Puzzle ID, e.g. M0K3M9Q1', 'aria-label':'Puzzle ID', autocomplete:'off', spellcheck:'false'});
     const err = el('p',{class:'note'});
     const go = ()=>{ err.textContent = enterPuzzle(input.value); };
     input.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); go(); } });
     dlgBody.append(el('div',{class:'row'}, input, el('button',{class:'btn primary', text:'Play it', onclick:go})), err);
 
     dlgBody.append(el('h3',{text:'SHARE THE PUZZLE YOU ARE PLAYING'}));
-    const code = puzzle.join('');
-    const share = el('input',{type:'text', readonly:'readonly', value:code, 'aria-label':'Puzzle code'});
+    const short = SEED_ID.test(pid);
+    const shareText = short ? pid.slice(3) : puzzle.join('');
+    const share = el('input',{type:'text', readonly:'readonly', value:shareText, 'aria-label':'Puzzle ID to share'});
     share.addEventListener('focus', ()=> share.select());
-    const copied = el('p',{class:'note', text:'ID ' + pid + '. Anyone can paste the code above into Enter / share to play exactly this puzzle.'});
-    dlgBody.append(el('div',{class:'row'}, share, el('button',{class:'btn', text:'Copy code', onclick: async ()=>{
-      try{ await navigator.clipboard.writeText(code); copied.textContent = 'Code copied.'; }
-      catch(e){ share.select(); copied.textContent = 'Press Ctrl+C to copy the selected code.'; }
+    const copied = el('p',{class:'note', text: short
+      ? 'Type this ID into Enter / share on any device and you get exactly this puzzle.'
+      : 'This puzzle is from an older version or was typed in, so it has no short ID. Its 81 digits work on any device.'});
+    dlgBody.append(el('div',{class:'row'}, share, el('button',{class:'btn', text: short ? 'Copy ID' : 'Copy digits', onclick: async ()=>{
+      try{ await navigator.clipboard.writeText(shareText); copied.textContent = 'Copied.'; }
+      catch(e){ share.select(); copied.textContent = 'Press Ctrl+C to copy the selected text.'; }
     }})), copied);
     dlg.showModal();
     input.focus();
